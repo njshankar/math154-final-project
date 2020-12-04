@@ -1,1 +1,1018 @@
+---
+title: "Math154 Final Project - Kaggle housing analysis"
+author: "JJ Shankar"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(fastDummies)
+require(rpart)
+require(randomForest)
+require(e1071)
+require(ggplot2)
+library(xgboost)
+library(caret)
+library(reshape2)
+library(glmnet)
+library(corrplot)
+require(scales)
+```
+
+## Initial steps
+
+Read in the data
+
+```{r}
+train.house <- read.csv("C:\\Users\\njsha\\Downloads\\trainhouse.csv")
+test.house <- read.csv("C:\\Users\\njsha\\Downloads\\testhouse.csv")
+```
+
+Pick out the vector of reponse variables. We're trying to predict the sale price of each house using the other features.
+
+```{r}
+train.y <- train.house$SalePrice
+train.x <- train.house[, -c(1,81)]
+test.x <- test.house[, -c(1)]
+
+all.x <- as.data.frame(rbind(train.x, test.x))
+```
+
+## Generating Correlation Heatmap
+
+Find the numeric columns of the training set:
+
+```{r}
+num_cols <- unlist(lapply(train.house, is.numeric)) 
+train.numeric <- train.house[ , num_cols]
+```
+
+Generate correlation matrix and heatmap:
+
+```{r}
+cormat <- cor(train.numeric, use = "complete.obs")
+```
+
+```{r}
+#png(height=1800, width=1800, #file="C:\\Users\\njsha\\Downloads\\corrplot.png", type = "cairo")
+
+corrplot(cormat, tl.col = "black", order = "hclust", hclust.method = "average", addrect = 4, tl.cex = 0.3)
+
+#dev.off()
+
+```
+
+## Outlier Removal
+
+Let's plot some of our numerical variables, in fact, all of them, against the reponse variable:
+
+```{r}
+
+train.numeric <- train.numeric[, -1]
+
+train.numeric.df <- as.data.frame(cbind(train.y, train.numeric))
+
+for (col in 1:ncol(train.numeric)){
+ plot(train.numeric[,col], train.y, main = colnames(train.numeric)[col])
+}
+```
+
+
+From these scatterplots, there doesn't appear to be too many egregious outliers, although some houses do appear to be quite a bit larger than the rest. We'll hone in on the variables of LotArea and LotFrontage for now, removing some of the big outliers there:
+
+```{r}
+train.house <- train.house[(train.house$LotArea < 100000),]
+train.house <- train.house[-c(935,1299),]
+
+train.y <- train.house$SalePrice
+train.x <- train.house[, -c(1,81)]
+
+```
+
+# Looking at the Neighborhood feature
+
+Find median home price in each neighborhood:
+
+```{r}
+
+neighframe <- as.data.frame(table(train.x$Neighborhood))
+
+neigh.counts <- c()
+neigh.medians <- c()
+
+for (i in 1:nrow(neighframe)){
+  neigh.medians[i] <- median(train.y[train.x$Neighborhood == neighframe[i,1]])
+  
+  neigh.counts[i] <- sum(train.x$Neighborhood == neighframe[i,1])
+  
+}
+
+neighframe <- cbind(neighframe, neigh.medians, neigh.counts)
+
+neighframe <- neighframe[order(neighframe$neigh.medians, decreasing = TRUE),]
+
+```
+
+Generate a plot of median sale prices by neighborhood:
+
+```{r}
+png(height=1800, width=1800, file="C:\\Users\\njsha\\Downloads\\neighplot.png", type = "cairo")
+
+
+ggplot(data = neighframe, mapping = aes(x = reorder(Var1, neigh.medians), y = neigh.medians)) + geom_bar(stat = 'identity', fill = 'firebrick') + xlab("Neighborhood") + ylab("Median Sale Price") + scale_y_continuous(labels = comma) + coord_flip() + geom_text(aes(label=neigh.counts), hjust=-0.3, size = 15)+
+  theme_minimal() + theme(text = element_text(size = 50)) 
+
+dev.off()
+```
+
+# Looking at the MSSubClass feature
+
+Find median home price over each housing class:
+
+```{r}
+MSframe <- as.data.frame(table(train.x$MSSubClass))
+
+MS.medians <- c()
+
+for (i in 1:nrow(MSframe)){
+  MS.medians[i] <- median(train.y[train.x$MSSubClass == MSframe[i,1]])
+}
+
+MSframe <- cbind(MSframe, MS.medians)
+
+MSframe <- MSframe[order(MSframe$MS.medians, decreasing = TRUE),]
+```
+
+Create a barplot with the results:
+
+```{r}
+png(height=1800, width=1800, file="C:\\Users\\njsha\\Downloads\\MSplot.png", type = "cairo")
+
+
+ggplot(data = MSframe, mapping = aes(x = reorder(Var1, MS.medians), y = MS.medians)) + geom_bar(stat = 'identity', fill = 'steelblue') + xlab("Housing Class") + ylab("Median Sale Price") + scale_y_continuous(labels = comma) + coord_flip() + geom_text(aes(label=Freq), hjust=-0.3, size = 15)+
+  theme_minimal() + theme(text = element_text(size = 50)) 
+
+dev.off()
+```
+
+
+## Handling missing data
+
+Do we have any missing data here? Let's take a look.
+
+```{r}
+sum(is.na(train.x))
+```
+
+Yes we do. Let's see where these missing values are (columnwise) in the train set:
+
+```{r}
+missing.feat.train <- c()
+missing.num.train <- c()
+
+for (col in 1:ncol(train.x)){
+  if (sum(is.na(train.x[,col])) > 0){
+    missing.feat.train <- c(missing.feat.train, col)
+    missing.num.train <- c(missing.num.train, sum(is.na(train.x[,col])))
+  }
+}
+
+missing.feat.train
+missing.num.train
+
+```
+
+```{r}
+View(cbind(colnames(train.x)[missing.feat.train], missing.num.train))
+```
+
+
+Do the same for the test set:
+
+```{r}
+missing.feat.test <- c()
+missing.num.test <- c()
+
+for (col in 1:ncol(test.x)){
+  if (sum(is.na(test.x[,col])) > 0){
+    missing.feat.test <- c(missing.feat.test, col)
+    missing.num.test <- c(missing.num.test, sum(is.na(test.x[,col])))
+  }
+}
+
+missing.feat.test
+missing.num.test
+
+```
+
+```{r}
+colnames(test.x)[missing.feat.train]
+
+```
+
+From these column names and the descriptions of the features from Kaggle, identify features where NA is to be expected. For these categories, NA should be considered as a factor.
+
+```{r}
+workables <- missing.feat.train[c(2,5,6,7,8,9,11,12,15,16,17,18,19)]
+```
+
+Make NA into a factor for these columns:
+
+```{r}
+for (var in workables){
+  train.x[,var] <- addNA(train.x[,var])
+  test.x[,var] <- addNA(test.x[,var])
+}
+```
+
+Delete the one observation in the train set with an NA value for Electrical:
+
+```{r}
+train.y <- train.y[-which(is.na(train.x$Electrical))]
+train.x <- train.x[-which(is.na(train.x$Electrical)),]
+```
+
+Identify the NA columns once more for both test and train:
+
+```{r}
+missing.feat.train <- c()
+missing.num.train <- c()
+
+for (col in 1:ncol(train.x)){
+  if (sum(is.na(train.x[,col])) > 0){
+    missing.feat.train <- c(missing.feat.train, col)
+    missing.num.train <- c(missing.num.train, sum(is.na(train.x[,col])))
+  }
+}
+
+missing.feat.train
+missing.num.train
+```
+
+
+
+```{r}
+missing.feat.test <- c()
+missing.num.test <- c()
+
+for (col in 1:ncol(test.x)){
+  if (sum(is.na(test.x[,col])) > 0){
+    missing.feat.test <- c(missing.feat.test, col)
+    missing.num.test <- c(missing.num.test, sum(is.na(test.x[,col])))
+  }
+}
+
+missing.feat.test
+missing.num.test
+
+```
+```{r}
+colnames(test.x)[missing.feat.test]
+
+```
+
+Considerably less now, but still a few more columns to go. Fill in a few more miscellaneous values for the test set now (zeroes because these houses didn't have basements/garages):
+
+```{r}
+
+test.x[which(is.na(test.x$BsmtFinSF1)),which(colnames(test.x) =="BsmtFinSF1")] <- 0
+test.x[which(is.na(test.x$BsmtFinSF2)),which(colnames(test.x) == "BsmtFinSF2")] <- 0
+test.x[which(is.na(test.x$BsmtUnfSF)),which(colnames(test.x) == "BsmtUnfSF")] <- 0
+test.x[which(is.na(test.x$TotalBsmtSF)),which(colnames(test.x) == "TotalBsmtSF")] <- 0
+
+test.x[which(is.na(test.x$BsmtFullBath)),which(colnames(test.x) == "BsmtFullBath")] <- 0
+test.x[which(is.na(test.x$BsmtHalfBath)),which(colnames(test.x) == "BsmtHalfBath")] <- 0
+
+test.x[which(is.na(test.x$GarageCars)),which(colnames(test.x) == "GarageCars")] <- 0
+test.x[which(is.na(test.x$GarageArea)),which(colnames(test.x) == "GarageArea")] <- 0
+
+
+```
+
+Some simple most frequent category imputation for the few missing values in certain categorical columns:
+
+```{r}
+test.x[which(is.na(test.x$Exterior2nd)),which(colnames(test.x) == "Exterior2nd")] <- "VinylSd"
+test.x[which(is.na(test.x$Exterior1st)),which(colnames(test.x) == "Exterior1st")] <- "VinylSd"
+
+test.x[which(is.na(test.x$SaleType)),which(colnames(test.x) == "SaleType")] <- "WD"
+
+test.x[which(is.na(test.x$KitchenQual)),which(colnames(test.x) == "KitchenQual")] <- "TA"
+
+test.x[which(is.na(test.x$Functional)),which(colnames(test.x) == "Functional")] <- "Min1"
+
+test.x[which(is.na(test.x$Utilities)),which(colnames(test.x) == "Utilities")] <- "AllPub"
+
+test.x[which(is.na(test.x$MSZoning)),which(colnames(test.x) == "MSZoning")] <- "RL"
+
+
+#------------  masonry -----
+
+
+test.x[which(is.na(test.x$MasVnrType)),which(colnames(test.x) == "MasVnrType")] <- "None"
+
+test.x[which(is.na(test.x$MasVnrArea)),which(colnames(test.x) == "MasVnrArea")] <- 0
+
+train.x[which(is.na(train.x$MasVnrType)),which(colnames(train.x) == "MasVnrType")] <- "None"
+
+train.x[which(is.na(train.x$MasVnrArea)),which(colnames(train.x) == "MasVnrArea")] <- 0
+
+```
+
+Columns 59 and 60 we can go without. GarageYrBlt is highly colinear with YearBuilt, and GarageFinish didn't exhibit much of a correlation at all with the response variable from our initial plots:
+
+```{r}
+
+#drop GarageYrBlt
+#drop GarageFinish
+
+drop1 <- which(colnames(train.x) == "GarageYrBlt")
+drop2 <- which(colnames(train.x) == "GarageFinish")
+
+
+train.x <- train.x[,-c(drop1,drop2)]
+test.x <- test.x[,-c(drop1,drop2)]
+
+```
+
+Impute the median lot frontage per neighborhood in place of missing values:
+
+```{r}
+neighmedians.train <- c()
+neighmedians.test <- c()
+
+for (i in 1:nrow(train.x)){
+  neighmedians.train[i] <- median(train.x$LotFrontage[train.x$Neighborhood == train.x$Neighborhood[i]], TRUE)
+}
+
+
+for (i in 1:nrow(test.x)){
+  neighmedians.test[i] <- median(test.x$LotFrontage[test.x$Neighborhood == test.x$Neighborhood[i]], TRUE)
+}
+```
+
+```{r}
+train.x$LotFrontage[is.na(train.x$LotFrontage)] <-  neighmedians.train[is.na(train.x$LotFrontage)]
+
+test.x$LotFrontage[is.na(test.x$LotFrontage)] <-  neighmedians.test[is.na(test.x$LotFrontage)]
+
+```
+
+## Drop a few more highly correlated columns:
+
+```{r}
+#drop GarageArea (highly correlated with GarageCars)
+
+drop1 <- which(colnames(train.x) == "GarageArea")
+
+
+train.x <- train.x[,-c(drop1)]
+test.x <- test.x[,-c(drop1)]
+
+```
+
+## Generate a new feature for House Age
+
+```{r}
+train.x["HouseAge"] <- train.x$YrSold - train.x$YearRemodAdd
+test.x["HouseAge"] <- test.x$YrSold - test.x$YearRemodAdd
+```
+
+## Generate a new feature for whether the house was remodeled or not
+
+```{r}
+train.x["WasRemodeled"] <- 1 * (train.x$YearBuilt == train.x$YearRemodAdd)
+
+test.x["WasRemodeled"] <- 1 * (test.x$YearBuilt == test.x$YearRemodAdd)
+
+```
+
+## delete feature for yearremodadd
+
+```{r}
+
+drop1 <- which(colnames(train.x) == "YearRemodAdd")
+
+train.x <- train.x[, -drop1]
+test.x <- test.x[,-drop1]
+```
+
+## Factorizing Categorical Variables Represented as Numbers
+
+Finally, code up MSSubClass variables as factors (since this seems to be a categorical variable):
+
+```{r}
+train.x$MSSubClass <- as.factor(train.x$MSSubClass)
+test.x$MSSubClass <- as.factor(test.x$MSSubClass)
+
+#Years and Months Sold (make these into factors too, since months are restrained from 1 to 12, and years are all between 2006 and 2010)
+
+train.x$MoSold <- as.factor(train.x$MoSold)
+test.x$MoSold <- as.factor(test.x$MoSold)
+
+train.x$YrSold <- as.factor(train.x$YrSold)
+test.x$YrSold <- as.factor(test.x$YrSold)
+
+```
+
+
+## Preliminary Variable Importance with Random Forest
+
+Run a quick and dirty random forest regression:
+
+```{r}
+RF.varimp <- randomForest(train.y~., data=cbind(train.y, train.x), ntree = 100, importance = TRUE)
+```
+
+```{r}
+rf.imps <- importance(RF.varimp)
+```
+
+```{r}
+rf.imps.df <- data.frame(Variables = row.names(rf.imps), MSE = rf.imps[,1])
+rf.imps.df <- rf.imps.df[order(rf.imps.df$MSE, decreasing = TRUE),]
+
+most.imp.df <- rf.imps.df[1:12, ]
+```
+
+Generate a plot of the most important variables:
+
+```{r}
+
+png(height=1800, width=1800, file="C:\\Users\\njsha\\Downloads\\implot.png", type = "cairo")
+
+imp.plot <- ggplot(data = most.imp.df, mapping = aes(x = reorder(Variables, MSE), y = MSE, fill = MSE)) + geom_bar(stat = 'identity') + coord_flip() + xlab("Variable") + ylab("Importance (Percent Increase MSE)") + theme(text = element_text(size = 50))    
+
+imp.plot
+
+dev.off()
+```
+
+## Add New Feature for Total Bathrooms
+
+```{r}
+train.x["TotalBath"] = train.x$FullBath + 0.5* train.x$HalfBath + train.x$BsmtFullBath + 0.5*train.x$BsmtHalfBath
+
+test.x["TotalBath"] = test.x$FullBath + 0.5* test.x$HalfBath + test.x$BsmtFullBath + 0.5*test.x$BsmtHalfBath
+
+dropcols <- c()
+
+train.x <- train.x[,-c(which(colnames(train.x) == "FullBath"),which(colnames(train.x) == "HalfBath"),which(colnames(train.x) == "BsmtFullBath"),which(colnames(train.x) == "BsmtHalfBath"))]
+
+
+test.x <- test.x[,-c(which(colnames(test.x) == "FullBath"),which(colnames(test.x) == "HalfBath"),which(colnames(test.x) == "BsmtFullBath"),which(colnames(test.x) == "BsmtHalfBath"))]
+
+```
+
+## Look at Pool, add new factor
+
+```{r}
+#remove PoolArea
+
+drop1 <- which(colnames(train.x) == "PoolArea")
+
+train.x <- train.x[,-drop1]
+test.x <- test.x[,-drop1]
+
+haspool <- c()
+
+for (i in 1:nrow(train.x)){
+  if ((train.x$PoolQC[i] == "Ex") || (train.x$PoolQC[i] == "Fa") || (train.x$PoolQC[i] == "Gd" )){
+    haspool[i] <- "Yes"}
+  else{
+    haspool[i] <- "No"}
+}
+
+train.x["HasPool"] <- as.factor(haspool)
+
+haspool.test <- c()
+
+for (i in 1:nrow(test.x)){
+  if ((test.x$PoolQC[i] == "Ex") || (test.x$PoolQC[i] == "Fa") || (test.x$PoolQC[i] == "Gd" )){
+    haspool.test[i] <- "Yes"}
+  else{
+    haspool.test[i] <- "No"}
+}
+
+test.x["HasPool"] <- as.factor(haspool.test)
+
+# remove pool QC
+
+drop1 <- which(colnames(train.x) == "PoolQC")
+
+train.x <- train.x[,-drop1]
+test.x <- test.x[,-drop1]
+
+
+```
+
+## Add feature for total living space
+
+```{r}
+
+train.x["TotalLivingSF"] <- train.x$TotalBsmtSF + train.x$GrLivArea
+test.x["TotalLivingSF"] <- test.x$TotalBsmtSF + test.x$GrLivArea
+
+
+```
+
+## Add feature for total Porch area
+
+```{r}
+train.x["TotalPorchArea"] <- train.x$OpenPorchSF + train.x$EnclosedPorch + train.x$X3SsnPorch + train.x$ScreenPorch
+
+test.x["TotalPorchArea"] <- test.x$OpenPorchSF + test.x$EnclosedPorch + test.x$X3SsnPorch + test.x$ScreenPorch
+
+
+# delee other porch features
+train.x <- train.x[,-c(which(colnames(train.x) == "OpenPorchSF")
+,which(colnames(train.x) == "EnclosedPorch")
+,which(colnames(train.x) == "X3SsnPorch")
+,which(colnames(train.x) == "ScreenPorch")
+)]
+
+test.x <- test.x[,-c(which(colnames(test.x) == "OpenPorchSF")
+,which(colnames(test.x) == "EnclosedPorch")
+,which(colnames(test.x) == "X3SsnPorch")
+,which(colnames(test.x) == "ScreenPorch")
+)]
+
+```
+
+## drop utilities and condition2
+
+```{r}
+
+drop1 <- which(colnames(test.x) == "Utilities")
+drop2 <- which(colnames(test.x) == "TotRmsAbvGrd")
+
+train.x <- train.x[,-c(drop1, drop2)]
+test.x <- test.x[,-c(drop1, drop2)]
+
+```
+
+
+## Working with numeric variables
+
+Find which remaining features are numeric:
+
+```{r}
+num_cols <- unlist(lapply(train.x, is.numeric)) 
+num_cols1 <- which(num_cols == TRUE)
+```
+
+#create numeric dataframe
+
+```{r}
+train.x.numeric <- train.x[,num_cols1]
+test.x.numeric <- test.x[,num_cols1]
+```
+
+# log(1+x) transformations of numeric columns
+
+```{r}
+
+train.x.logs <- log(train.x.numeric + 1)
+test.x.logs <- log(test.x.numeric + 1)
+
+names(train.x.logs) <- paste0(names(train.x.numeric), "_log")
+names(test.x.logs) <- paste0(names(test.x.numeric), "_log")
+
+test.x.logs$HouseAge_log[1090] <- 0 # fill in the one NaN generated with a zero
+```
+
+# squared transformations of numeric columns
+
+```{r}
+train.x.sqrs <- (train.x.numeric)^2
+test.x.sqrs <- (test.x.numeric)^2
+
+names(train.x.sqrs) <- paste0(names(train.x.numeric), "_sqr")
+names(test.x.sqrs) <- paste0(names(test.x.numeric), "_sqr")
+```
+
+Create an augmented dataset that includes these new transformed numerical features, as well as the original ones:
+
+```{r}
+train.x.aug <- as.data.frame(cbind(train.x, train.x.logs, train.x.sqrs))
+
+test.x.aug <- as.data.frame(cbind(test.x, test.x.logs, test.x.sqrs))
+
+```
+
+#remove house age log column:
+
+It seemed to be causing us some trouble:
+
+```{r}
+drop1 <- which(colnames(train.x.aug) == "HouseAge_log")
+
+train.x.aug <- train.x.aug[,-drop1]
+test.x.aug <- test.x.aug[,-drop1]
+```
+
+## scale the numeric variables
+
+```{r}
+#which features are numeric for augmented df?
+num_cols <- unlist(lapply(train.x.aug, is.numeric)) 
+num_cols1 <- which(num_cols == TRUE)
+```
+
+```{r}
+for (i in num_cols1){
+  train.x.aug[,i] <- scale(train.x.aug[,i])
+  test.x.aug[,i] <- scale(test.x.aug[,i])
+}
+```
+
+## Deal with category 150 entry in test set for MSSubClass
+
+```{r}
+test.x$MSSubClass[test.x$MSSubClass == 150] <- 160
+
+test.x.aug$MSSubClass[test.x.aug$MSSubClass == 150] <- 160
+
+```
+
+
+## One Hot Encoding of Categorical Variables
+
+```{r}
+
+dummy1 <- dummyVars(" ~ .", data=train.x.aug, fullrank=T)
+
+train.x.dummies <- data.frame(predict(dummy1, newdata = train.x.aug))
+
+test.x.dummies <- data.frame(predict(dummy1, newdata = test.x.aug))
+
+```
+
+## Deal with skewness in response variable
+
+This was recommended by some sources that I read through online. 
+
+```{r}
+
+train.y <- log(train.y + 1)
+```
+
+## Tune Random Forest Model
+
+Grid Search on mtry (from 1 to 50):
+
+```{r}
+control <- trainControl(method="cv", number=3, search="grid")
+tunegrid <- expand.grid(.mtry=c(1:50))
+metric <- "RMSE"
+
+
+rf_gridsearch <- train(train.y~., data=cbind(train.y, train.x.dummies), method="rf", metric=metric, tuneGrid=tunegrid, trControl=control)
+print(rf_gridsearch)
+
+#Generate Plot of the tuning process for mtree
+
+png(height=1800, width=1800, file="C:\\Users\\njsha\\Downloads\\mtree.png", type = "cairo")
+
+
+plot(rf_gridsearch, xlab = "mtree", cex.lab=500, cex.axis=500, cex.main=500, cex.sub=500)
+
+dev.off()
+```
+
+An alternative method to find the optimal value of mtry, using the tuneRF function:
+
+```{r}
+bestmtry <- tuneRF(train.x.dummies, train.y, stepFactor=1.5, improve=1e-7, ntree= 500)
+print(bestmtry)
+```
+
+The optimal value using both methods was around 36.
+
+
+# run random forest model on the optimal mtree parameter. 
+
+```{r}
+rf.bestmtry <- randomForest(train.y~., cbind(train.y, train.x.dummies), ntree = 1500, mtry = 36)
+```
+
+A brilliant trick to equalize classes
+
+```{r}
+test.x.dummies <- rbind(train.x.dummies[1, ] , test.x.dummies)
+test.x.dummies <- test.x.dummies[-1,]
+```
+
+Fit the tuned RF regression model on the testing set. 
+
+```{r}
+rf.predict <- predict(rf.bestmtry, test.x.dummies)
+```
+
+Package into a format acceptable for Kaggle.
+
+```{r}
+sub1 <- as.data.frame(cbind(test.house$Id, exp(rf.predict)))
+colnames(sub1)[1] <- "Id"
+colnames(sub1)[2] <- "SalePrice"
+
+write.csv(sub1,"C:\\Users\\njsha\\Downloads\\sub1.csv", row.names = FALSE)
+
+```
+
+# random forest variable importance
+
+```{r}
+RF.varimp <- randomForest(train.y~., data=cbind(train.y, train.x.dummies), ntree = 1500, mtry = 36, importance = TRUE)
+```
+
+```{r}
+rf.imps <- importance(RF.varimp)
+```
+
+```{r}
+rf.imps.df <- data.frame(Variables = row.names(rf.imps), MSE = rf.imps[,1])
+rf.imps.df <- rf.imps.df[order(rf.imps.df$MSE, decreasing = TRUE),]
+
+most.imp.df <- rf.imps.df[1:20, ]
+```
+
+Generate Random Forest regression variable importance plot (for 20 most important variables):
+
+```{r}
+
+png(height=1800, width=1800, file="C:\\Users\\njsha\\Downloads\\implot.png", type = "cairo")
+
+imp.plot <- ggplot(data = most.imp.df, mapping = aes(x = reorder(Variables, MSE), y = MSE, fill = MSE)) + geom_bar(stat = 'identity', color = "fir") + coord_flip() + xlab("Variable") + ylab("Importance (Percent Increase MSE)") + theme_minimal() + theme(text = element_text(size = 50)) 
+
+imp.plot
+
+dev.off()
+```
+
+# LASSO
+
+Cross validate the cost parameter for LASSO using glmnet:
+
+```{r}
+cv1 <- cv.glmnet(as.matrix(train.x.dummies), as.matrix(train.y), alpha = 1)
+
+# generate a plot
+
+png(height=1800, width=1800, file="C:\\Users\\njsha\\Downloads\\lassoplot.png", type = "cairo")
+
+plot(cv1)
+
+dev.off()
+
+# Define the optimal cost parameters yielded by CV
+
+lam_min <- cv1$lambda.min
+
+lam_1se <- cv1$lambda.1se
+
+# run fits for both values of lambda
+
+fit.1se <- glmnet(as.matrix(train.x.dummies),as.matrix(train.y), alpha=1, lambda = lam_1se)
+fit.min <- glmnet(as.matrix(train.x.dummies),as.matrix(train.y), alpha = 1, lambda = lam_min)
+
+```
+
+Run both fits on the testing set.
+
+```{r}
+
+lasso.pred1 <- predict(fit.1se, as.matrix(test.x.dummies))
+
+lasso.pred2 <- predict(fit.min, as.matrix(test.x.dummies))
+
+```
+
+Put results in format acceptable to Kaggle
+
+```{r}
+
+sub2 <- as.data.frame(cbind(test.house$Id, exp(lasso.pred1)))
+colnames(sub2)[1] <- "Id"
+colnames(sub2)[2] <- "SalePrice"
+
+write.csv(sub2,"C:\\Users\\njsha\\Downloads\\sub2.csv", row.names = FALSE)
+
+```
+
+```{r}
+
+sub3 <- as.data.frame(cbind(test.house$Id, exp(lasso.pred2)))
+colnames(sub3)[1] <- "Id"
+colnames(sub3)[2] <- "SalePrice"
+
+write.csv(sub3,"C:\\Users\\njsha\\Downloads\\sub3.csv", row.names = FALSE)
+
+```
+
+
+## Put in matrix form for XGBoost
+
+```{r}
+xgb.dumbtrain = xgb.DMatrix(data = as.matrix(train.x.dummies), label = as.matrix(train.y))
+xgb.dumbtest = xgb.DMatrix(data = as.matrix(test.x.dummies))
+```
+
+
+## Tune XG BOOST (eta, max_depth, min_child_weight)
+
+Create control for training:
+
+```{r}
+xgb_control_1 <- trainControl(method = "cv", number = 5, allowParallel = TRUE)
+```
+
+Do a grid-search tune:
+
+```{r}
+xgb_grid_1 = expand.grid(
+  nrounds = 1000,
+  eta = c(0.1, 0.05, 0.01),
+  max_depth = c(2, 3, 4, 5, 6), 
+  gamma = 0, 
+  colsample_bytree=1, 
+  min_child_weight=c(1, 2, 3, 4 ,5), 
+  subsample=1)
+```
+
+```{r}
+xgb_train_1 = train(x = train.x.dummies, y = train.y, method = 'xgbTree', trControl = xgb_control_1, tuneGrid = xgb_grid_1)
+```
+
+## Tune XGBoost (nrounds)
+
+Using optimal values from last tune for eta, max_depth, and min_child_weight, tune nrounds:
+
+```{r}
+params <- list(booster = "gbtree", objective = "reg:squarederror", eta=0.05, gamma=0, max_depth=3, min_child_weight=2, subsample=1, colsample_bytree=1)
+
+```
+
+```{r}
+xgbcv <- xgb.cv( params = params, data = xgb.dumbtrain, nrounds = 1000, nfold = 5, showsd = T, stratified = T, print_every_n = 10, early_stopping_rounds = 60, maximize = F)
+```
+
+# GGPLOT for XGB cross validation of nrounds
+
+```{r}
+  png(height=1800, width=1800, file="C:\\Users\\njsha\\Downloads\\xgb1.png", type = "cairo")
+
+
+xgbcv.plot <- ggplot(data = as.data.frame(xgbcv$evaluation_log[100:1000,]), mapping = aes(x = iter, y = test_rmse_mean)) + geom_point(colour = 'firebrick') + xlab('nrounds') + ylab('cross validation RMSE mean') + theme_minimal() + theme(text = element_text(size = 50)) 
+
+xgbcv.plot
+  
+dev.off()
+
+```
+
+## train the tuned XGBoost model
+
+```{r}
+xgb.dumb <- xgboost(data = xgb.dumbtrain, eta=0.05, gamma=0, max_depth = 3, min_child_weight=2, subsample=1, colsample_bytree=1, nrounds = 413)
+```
+
+# variable importance plot for XGBoost
+
+```{r}
+xgb.implot <- xgb.importance (feature_names = colnames(train.x.dummies),model = xgb.dumb)
+
+
+png(height=1800, width=1800, file="C:\\Users\\njsha\\Downloads\\xgb2.png", type = "cairo")
+
+xgb.ggplot.importance(importance_matrix = xgb.implot[1:20], rel_to_first = TRUE) + theme_minimal() + theme(text = element_text(size = 50)) 
+
+dev.off()
+```
+
+## Fit the tuned XGBoost model to training set
+
+```{r}
+xgb.predict <- predict(xgb.dumb, xgb.dumbtest)
+
+```
+
+Package into kaggle format:
+
+```{r}
+sub4 <- as.data.frame(cbind(test.house$Id, exp(xgb.predict)))
+colnames(sub4)[1] <- "Id"
+colnames(sub4)[2] <- "SalePrice"
+
+write.csv(sub4,"C:\\Users\\njsha\\Downloads\\sub4.csv", row.names = FALSE)
+
+```
+
+
+## Blending predictions from two models
+
+Weight XGBoost 2/3, LASSO 1/3
+
+```{r}
+simple.blend <- (2*exp(xgb.predict) + exp(lasso.pred2))/3
+```
+
+Package into kaggle format:
+
+```{r}
+sub5 <- as.data.frame(cbind(test.house$Id, simple.blend))
+colnames(sub5)[1] <- "Id"
+colnames(sub5)[2] <- "SalePrice"
+
+write.csv(sub5,"C:\\Users\\njsha\\Downloads\\sub5.csv", row.names = FALSE)
+
+```
+
+RMSE is 0.12552
+
+Weight LASSO and XGBoost 1/2 each:
+
+```{r}
+simple.blend2 <- (exp(xgb.predict) + exp(lasso.pred2))/2
+```
+
+
+Package into kaggle format:
+
+```{r}
+sub6 <- as.data.frame(cbind(test.house$Id, simple.blend2))
+colnames(sub6)[1] <- "Id"
+colnames(sub6)[2] <- "SalePrice"
+
+write.csv(sub6,"C:\\Users\\njsha\\Downloads\\sub6.csv", row.names = FALSE)
+
+```
+
+RMSE is 0.12511.
+
+Weight LASSO 2/3 now, and XGBoost 1/3:
+
+```{r}
+simple.blend3 <- (exp(xgb.predict) + 2*exp(lasso.pred2))/3
+```
+
+Package into kaggle format:
+
+```{r}
+sub7 <- as.data.frame(cbind(test.house$Id, simple.blend3))
+colnames(sub7)[1] <- "Id"
+colnames(sub7)[2] <- "SalePrice"
+
+write.csv(sub7,"C:\\Users\\njsha\\Downloads\\sub7.csv", row.names = FALSE)
+
+```
+
+3/4 Proportions for both LASSO and XGBoost:
+
+```{r}
+#3/4 LASSO
+simple.blend4 <- (exp(xgb.predict) + 3*exp(lasso.pred2))/4
+
+#3/4 XGB
+simple.blend5 <- (3*exp(xgb.predict) + exp(lasso.pred2))/4
+```
+
+Package into kaggle format:
+
+```{r}
+sub8 <- as.data.frame(cbind(test.house$Id, simple.blend4))
+colnames(sub8)[1] <- "Id"
+colnames(sub8)[2] <- "SalePrice"
+
+write.csv(sub8,"C:\\Users\\njsha\\Downloads\\sub8.csv", row.names = FALSE)
+
+```
+
+```{r}
+sub9 <- as.data.frame(cbind(test.house$Id, simple.blend5))
+colnames(sub9)[1] <- "Id"
+colnames(sub9)[2] <- "SalePrice"
+
+write.csv(sub9,"C:\\Users\\njsha\\Downloads\\sub9.csv", row.names = FALSE)
+
+```
+
+
+# 1/5 RF, 2/5 LASSO, 2/5 XGB
+
+
+```{r}
+#3/4 LASSO
+simple.blend6 <- (exp(rf.predict) + 2*exp(xgb.predict) + 2*exp(lasso.pred2))/5
+
+```
+
+```{r}
+sub10 <- as.data.frame(cbind(test.house$Id, simple.blend6))
+colnames(sub10)[1] <- "Id"
+colnames(sub10)[2] <- "SalePrice"
+
+write.csv(sub10,"C:\\Users\\njsha\\Downloads\\sub10.csv", row.names = FALSE)
+
+```
 
